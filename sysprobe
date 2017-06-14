@@ -1,0 +1,313 @@
+#!/bin/bash
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+declare CATAPULT
+declare CATAPULT_B
+declare TRACE
+declare SIZE
+declare WEB
+
+_tracefs=
+_kprobe=
+
+function info
+{
+	echo "I: $1"
+}
+
+function dbg
+{
+	echo "D: $1"
+}
+
+function var_init
+{
+	CATAPULT=${CATAPULT=https://github.com/ibanezchen/catapult.git}
+	CATAPULT_B=${CATAPULT_B=sysprobe}
+	TRACE=${TRACE=$(date +%Y%m%d_%H%m%S).trace}
+	SIZE=${SIZE=2048}
+	WEB=google-chrome-stable
+	info "CATAPULT   = ${CATAPULT}"
+	info "CATAPULT_B = ${CATAPULT_B}"
+	info "TRACE      = ${TRACE}"
+	info "SIZE       = ${SIZE}"
+	info "WEB        = ${WEB}"
+}
+
+function tool_chk
+{
+	local tool=$1
+	if ! ${tool} 2>&1 >/dev/null; then
+		info "no ${tool}"
+		exit -1
+	fi
+}
+
+function tool_update_catapult
+{
+	info "catapult init"
+	echo
+	if ! [ -d ${HOME}/.catapult ]; then
+		info "fetch ${CATAPULT} ${CATAPULT_B}"
+		git clone ${CATAPULT} ${HOME}/.catapult
+	fi
+	cd ${HOME}/.catapult
+	git checkout ${CATAPULT_B} || exit 1
+	cd - >/dev/null 2>&1
+}
+
+function host_init
+{
+	tool_chk "adb version"
+	tool_chk "git version"
+	tool_update_catapult
+	adb root || exit 1
+	echo
+}
+
+function target_has
+{
+	local path=$1
+	if adb shell "ls ${path}" | grep "No such" 2>&1 >/dev/null; then
+		echo 0
+	else
+		echo 1
+	fi
+}
+
+function target_probe
+{
+	local n
+	if (( $(target_has "/sys/kernel/debug/tracing/events") > 0 )); then
+		_tracefs="/sys/kernel/debug/tracing"
+	fi
+	if (( $(target_has "/sys/kernel/tracing/events") > 0 )); then
+		_tracefs="/sys/kernel/tracing"
+	fi
+	if (( $(target_has "${_tracefs}/kprobe_events") > 0)); then
+		_kprobe=1
+	fi
+	info "_tracefs   = ${_tracefs}"
+	info "_kprobe    = ${_kprobe}"
+	if [ "${_tracefs}" == "" ]; then
+		info "no tracefs"
+		exit 1
+	fi
+}
+
+function _set
+{
+	local path=$1
+	local value=$2
+	dbg "$(printf "%6s = %10s\n" ${value} ${path})"
+	adb shell "echo ${value} > ${path}"
+}
+
+function _on
+{
+	_set $1 1
+}
+
+function _off
+{
+	_set $1 0
+}
+
+function _event_on
+{
+	local path=$1
+	_on "${_tracefs}/events/${path}/enable"
+}
+
+function _event_opt
+{
+	local path=$1
+	path="${_tracefs}/events/${path}/enable"
+	adb shell "if [ -f ${path} ]; then echo 1 > ${path}; fi"
+}
+
+function target_event_clear
+{
+	local _t=${_tracefs}
+	info "event clear"
+	# off all events
+	adb shell "for f in \$(ls ${_t}/events); do for ff in \$(ls ${_t}/events/\${f}); do if [ -d ${_t}/events/\${f}/\${ff} ];then echo 0 > ${_t}/events/\${f}/\${ff}/enable ; fi; done; done" >/dev/null 2>&1
+	# clear kprobe event
+	if [ "${_kprobe}" == "1" ]; then
+		_set "${_tracefs}/kprobe_events" ""
+	fi
+}
+
+function target_trace_on
+{
+	_on "${_tracefs}/tracing_on"
+}
+
+function target_trace_off
+{
+	_off "${_tracefs}/tracing_on"
+}
+
+function target_kprobe_add
+{
+	local sym=$1
+	if ! [ "${_kprobe}" == "1" ]; then
+		info "no kprobe"
+		return
+	fi
+	info "kprobe  : ${sym}"
+	adb shell "echo -n p:kp_${sym} ${sym} >> ${_tracefs}/kprobe_events"
+	adb shell "echo -n r:kp_${sym}_done ${sym} \$retval >> ${_tracefs}/kprobe_events"
+}
+
+function target_event_wildcard
+{
+	local cat=$1
+	local _t=${_tracefs}
+	info "wildcard: ${cat}"
+	if (( $(target_has "${_t}/events/${cat}") > 0 )); then
+		evts=$(adb shell ls ${_t}/events/${cat})
+		for e in $evts; do
+			if [ "${e}" == "enable" ]; then
+				continue
+			fi
+			if [ "${e}" == "filter" ]; then
+				continue
+			fi
+			_on ${_t}/events/${cat}/${e}/enable
+		done
+	fi
+}
+
+function target_event_category
+{
+	local cat=$1
+	info "category: ${cat}"
+	if [ "${cat}" == "sched" ]; then
+        _event_on  "sched/sched_switch"
+        _event_on  "sched/sched_wakeup"
+        _event_opt "sched/sched_blocked_reason"
+        _event_opt "sched/sched_cpu_hotplug"
+    elif [ "${cat}" == "irq" ]; then
+        _event_on  "irq"
+        _event_opt "ipi"
+    elif [ "${cat}" == "i2c" ]; then
+        _event_on  "i2c"
+        _event_on  "i2c/i2c_read"
+        _event_on  "i2c/i2c_write"
+        _event_on  "i2c/i2c_result"
+        _event_on  "i2c/i2c_reply"
+        _event_opt "i2c/smbus_read"
+        _event_opt "i2c/smbus_write"
+        _event_opt "i2c/smbus_result"
+        _event_opt "i2c/smbus_reply"
+    elif [ "${cat}" == "freq" ]; then
+        _event_on  "power/cpu_frequency"
+        _event_opt "power/clock_set_rate"
+        _event_opt "power/cpu_frequency_limits"
+    elif [ "${cat}" == "membus" ]; then
+        _event_on "memory_bus"
+    elif [ "${cat}" == "idle" ]; then
+        _event_on "power/cpu_idle"
+    elif [ "${cat}" == "disk" ]; then
+        _event_opt "f2fs/f2fs_sync_file_enter"
+        _event_opt "f2fs/f2fs_sync_file_exit"
+        _event_opt "f2fs/f2fs_write_begin"
+        _event_opt "f2fs/f2fs_write_end"
+        _event_opt "ext4/ext4_da_write_begin"
+        _event_opt "ext4/ext4_da_write_end"
+        _event_opt "ext4/ext4_sync_file_enter"
+        _event_opt "ext4/ext4_sync_file_exit"
+        _event_on  "block/block_rq_issue"
+        _event_on  "block/block_rq_complete"
+    elif [ "${cat}" == "mmc" ]; then
+        _event_on  "mmc"
+    elif [ "${cat}" == "load" ]; then
+        _event_on  "cpufreq_interactive"
+    elif [ "${cat}" == "sync" ]; then
+        _event_on  "sync"
+    elif [ "${cat}" == "workq" ]; then
+        _event_on  "workqueue"
+    elif [ "${cat}" == "memreclaim" ]; then
+        _event_on  "vmscan/mm_vmscan_direct_reclaim_begin"
+        _event_on  "vmscan/mm_vmscan_direct_reclaim_end"
+        _event_on  "vmscan/mm_vmscan_kswapd_wake"
+        _event_on  "vmscan/mm_vmscan_kswapd_sleep"
+    elif [ "${cat}" == "regulators" ]; then
+        _event_on  "regulator"
+    elif [ "${cat}" == "binder_driver" ]; then
+        _event_on  "binder/binder_transaction"
+        _event_on  "binder/binder_transaction_received"
+    elif [ "${cat}" == "binder_lock" ]; then
+        _event_on  "binder/binder_lock"
+        _event_on  "binder/binder_locked"
+        _event_on  "binder/binder_unlock"
+    elif [ "${cat}" == "pagecache" ]; then
+        _event_on  "filemap"
+	else
+		info "no ${cat}"
+	fi
+}
+
+cmd=$1
+shift
+if [ "${cmd}" == "-env" ]; then
+	var_init
+	host_init
+elif [ "${cmd}" == "-start" ]; then
+	var_init
+	target_probe
+	target_trace_off
+	target_event_clear
+	for a in $@; do
+		if [[ ${a} == *"+" ]]; then
+			# Add by symbol
+			a=${a%\+}
+			target_kprobe_add ${a}
+		elif [[ ${a} == *"-" ]]; then
+			# Add by file containing symbol
+			a=${a%\-}
+			for s in $(cat ${a}); do
+				target_kprobe_add ${s}
+			done
+		elif [[ ${a} == *"*" ]]; then
+			# Add by wildcard matching
+			a=${a%\*}
+			target_event_wildcard ${a}
+		else
+			# Add by static category
+			target_event_category ${a}
+		fi
+	done
+	target_event_wildcard kprobes
+	_set "${_tracefs}/buffer_size_kb" "${SIZE}"
+	_set "${_tracefs}/trace_clock" "global"
+	_set "${_tracefs}/current_tracer" "nop"
+	_on "${_tracefs}/options/print-tgid"
+	_on "${_tracefs}/options/overwrite"
+	target_trace_on
+elif [ "${cmd}" == "-dump" ]; then
+	var_init
+	target_probe
+	target_trace_off
+	machine=$(adb devices | sed -e '/List/d' | head -n 1 | cut -f1)
+	adb shell "cat ${_tracefs}/trace" > ${machine}_${TRACE}
+	info "convert ${machine}_${TRACE}"
+	html=$(${HOME}/.catapult/tracing/bin/trace2html ${machine}_${TRACE})
+	${WEB} $html
+else
+	echo "$0 -start [symbol_name+|symbol_file-|catagory*|category] ... "
+	echo "$0 -dump"
+	echo "$0 -env"
+fi
